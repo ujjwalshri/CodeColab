@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import Editor from '@monaco-editor/react';
 import { useMutation } from '@tanstack/react-query';
@@ -10,6 +10,7 @@ import UsernameModal from '../components/UsernameModal';
 import Split from 'react-split';
 import './Editor.css';
 import { CODE_SNIPPETS } from '../constants/languages';
+import { getCursorColorForUser, createCursorStyle } from '../utils/cursorColors';
 
 const EditorPage = () => {
   const location = useLocation();
@@ -20,6 +21,9 @@ const EditorPage = () => {
   const [isInRoom, setIsInRoom] = useState(false);
   const [isRemoteExecuting, setIsRemoteExecuting] = useState(false);
   const [showUsernameModal, setShowUsernameModal] = useState(!initialUsername && !!roomId);
+  const editorRef = useRef(null);
+  const monacoRef = useRef(null);
+  const cursorDecorations = useRef({});
 
   const getStorageKey = useCallback(() => {
     return `codecolab_${fileName || `untitled.${language}`}`;
@@ -62,6 +66,109 @@ const EditorPage = () => {
     
     setShowUsernameModal(false);
   };
+
+  // Function to handle editor mounting
+  const handleEditorDidMount = (editor, monaco) => {
+    editorRef.current = editor;
+    monacoRef.current = monaco;
+    
+    // Set up cursor movement tracking
+    if (roomId) {
+      editor.onDidChangeCursorPosition((e) => {
+        const position = editor.getPosition();
+        const selection = editor.getSelection();
+
+        // Only emit if we're in a room and this is a user action (not a programmatic change)
+        if (roomId && position && !lastRemoteUpdate || (Date.now() - lastRemoteUpdate > 100)) {
+          socketService.emitCursorPosition(roomId, {
+            position: {
+              lineNumber: position.lineNumber,
+              column: position.column
+            },
+            selection: selection ? {
+              startLineNumber: selection.startLineNumber,
+              startColumn: selection.startColumn,
+              endLineNumber: selection.endLineNumber,
+              endColumn: selection.endColumn
+            } : null
+          });
+        }
+      });
+    }
+  };
+
+  // Function to update cursor decorations
+  const updateCursorDecorations = useCallback((username, cursorData) => {
+    if (!editorRef.current || !monacoRef.current || username === initialUsername) return;
+
+    // Get or create decorations for this user
+    const monaco = monacoRef.current;
+    const editor = editorRef.current;
+    const color = getCursorColorForUser(username);
+    const { cursorStyle, labelStyle } = createCursorStyle(username, color);
+    
+    // Remove previous decorations for this user
+    if (cursorDecorations.current[username]) {
+      editor.deltaDecorations(cursorDecorations.current[username], []);
+    }
+    
+    // Create new decorations
+    const decorations = [];
+    
+    // Add cursor decoration
+    if (cursorData.position) {
+      decorations.push({
+        range: new monaco.Range(
+          cursorData.position.lineNumber,
+          cursorData.position.column,
+          cursorData.position.lineNumber,
+          cursorData.position.column
+        ),
+        options: {
+          className: cursorStyle.className,
+          hoverMessage: { value: username },
+          beforeContentClassName: cursorStyle.className,
+          after: {
+            content: username,
+            inlineClassName: labelStyle.className
+          }
+        }
+      });
+    }
+    
+    // Add selection decoration if applicable
+    if (cursorData.selection) {
+      const { startLineNumber, startColumn, endLineNumber, endColumn } = cursorData.selection;
+      if (
+        startLineNumber !== endLineNumber || 
+        startColumn !== endColumn
+      ) {
+        decorations.push({
+          range: new monaco.Range(
+            startLineNumber,
+            startColumn,
+            endLineNumber,
+            endColumn
+          ),
+          options: {
+            className: `remote-selection-${username.replace(/\s+/g, '-')}`,
+            hoverMessage: { value: `${username}'s selection` },
+            inlineClassName: `remote-selection-inline-${username.replace(/\s+/g, '-')}`,
+            minimap: {
+              color: color,
+              position: monaco.editor.MinimapPosition.Inline
+            }
+          }
+        });
+      }
+    }
+    
+    // Apply the decorations
+    if (decorations.length > 0) {
+      const ids = editor.deltaDecorations([], decorations);
+      cursorDecorations.current[username] = ids;
+    }
+  }, [initialUsername]);
 
   // Initialize socket connection and room handling
   useEffect(() => {
@@ -148,6 +255,19 @@ const EditorPage = () => {
       socketService.onUserLeft(({ username }) => {
         if (username) {
           setConnectedUsers(prev => prev.filter(user => user !== username));
+          
+          // Remove cursor decorations when a user leaves
+          if (editorRef.current && cursorDecorations.current[username]) {
+            editorRef.current.deltaDecorations(cursorDecorations.current[username], []);
+            delete cursorDecorations.current[username];
+          }
+        }
+      });
+
+      // Handle cursor position updates from other users
+      socketService.onCursorUpdate(({ username, position }) => {
+        if (username && username !== initialUsername) {
+          updateCursorDecorations(username, position);
         }
       });
 
@@ -170,7 +290,7 @@ const EditorPage = () => {
         socketService.disconnect();
       };
     }
-  }, [roomId, language, fileName, initialContent, editorContent, initialUsername]);
+  }, [roomId, language, fileName, initialContent, editorContent, initialUsername, updateCursorDecorations]);
 
   // Handle editor content changes
   useEffect(() => {
@@ -187,6 +307,64 @@ const EditorPage = () => {
       localStorage.removeItem(storageKey);
     };
   }, [getStorageKey]);
+
+  // Add CSS for remote cursors and selections
+  useEffect(() => {
+    // Create a style element for remote cursors and selections
+    const styleEl = document.createElement('style');
+    document.head.appendChild(styleEl);
+    
+    // Add base styles for remote cursors and selections
+    styleEl.innerHTML = `
+      .remote-cursor {
+        width: 2px !important;
+        margin-left: 0 !important;
+      }
+      
+      .remote-selection {
+        background-color: rgba(255, 255, 255, 0.2);
+      }
+    `;
+    
+    // Add specific styles for each connected user
+    if (connectedUsers.length > 0) {
+      connectedUsers.forEach(username => {
+        if (username !== initialUsername) {
+          const color = getCursorColorForUser(username);
+          const safeUsername = username.replace(/\s+/g, '-');
+          
+          styleEl.innerHTML += `
+            .remote-cursor-${safeUsername} {
+              background-color: ${color} !important;
+              width: 2px !important;
+            }
+            
+            .remote-cursor-label-${safeUsername} {
+              background-color: ${color};
+              color: white;
+              padding: 2px 5px;
+              border-radius: 2px;
+              font-size: 12px;
+              font-family: monospace;
+              z-index: 100;
+            }
+            
+            .remote-selection-${safeUsername} {
+              background-color: ${color}33;
+            }
+            
+            .remote-selection-inline-${safeUsername} {
+              background-color: ${color}33;
+            }
+          `;
+        }
+      });
+    }
+    
+    return () => {
+      document.head.removeChild(styleEl);
+    };
+  }, [connectedUsers, initialUsername]);
 
   const runMutation = useMutation({
     mutationFn: () => {
@@ -310,7 +488,10 @@ const EditorPage = () => {
                     <ul className="bg-base-300 rounded-lg p-2">
                       {connectedUsers.map((username, index) => (
                         <li key={index} className="flex items-center gap-2 py-1">
-                          <span className="w-2 h-2 rounded-full bg-green-500"></span>
+                          <span 
+                            className="w-2 h-2 rounded-full" 
+                            style={{ backgroundColor: getCursorColorForUser(username) }}
+                          ></span>
                           <span className="text-sm">{username}</span>
                         </li>
                       ))}
@@ -360,6 +541,7 @@ const EditorPage = () => {
                 theme="vs-dark"
                 value={editorContent}
                 onChange={handleEditorChange}
+                onMount={handleEditorDidMount}
                 options={{
                   minimap: { enabled: true },
                   fontSize: 14,

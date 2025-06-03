@@ -4,6 +4,9 @@ import Editor from '@monaco-editor/react';
 import { useMutation } from '@tanstack/react-query';
 import { motion, AnimatePresence } from 'framer-motion';
 import { runCode } from '../services/runCode';
+import { socketService } from '../services/socket';
+import RoomInfo from '../components/RoomInfo';
+import UsernameModal from '../components/UsernameModal';
 import Split from 'react-split';
 import './Editor.css';
 import { CODE_SNIPPETS } from '../constants/languages';
@@ -11,9 +14,13 @@ import { CODE_SNIPPETS } from '../constants/languages';
 const EditorPage = () => {
   const location = useLocation();
   const navigate = useNavigate();
-  const { language, fileName, content: initialContent } = location.state || {};
+  const { language, fileName, content: initialContent, roomId, username: initialUsername } = location.state || {};
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
-  
+  const [connectedUsers, setConnectedUsers] = useState([]);
+  const [isInRoom, setIsInRoom] = useState(false);
+  const [isRemoteExecuting, setIsRemoteExecuting] = useState(false);
+  const [showUsernameModal, setShowUsernameModal] = useState(!initialUsername && !!roomId);
+
   const getStorageKey = useCallback(() => {
     return `codecolab_${fileName || `untitled.${language}`}`;
   }, [fileName, language]);
@@ -42,8 +49,130 @@ const EditorPage = () => {
   });
 
   const [output, setOutput] = useState('');
+  const [lastRemoteUpdate, setLastRemoteUpdate] = useState(null);
+  
+  const handleUsernameSubmit = (username) => {
+    socketService.connect();
+    socketService.setUsername(username);
+    
+    if (roomId) {
+      socketService.joinRoom(roomId, username);
+      setIsInRoom(true);
+    }
+    
+    setShowUsernameModal(false);
+  };
 
-  // Save content to localStorage whenever it changes
+  // Initialize socket connection and room handling
+  useEffect(() => {
+    if (roomId && initialUsername) {
+      // Connect to socket server
+      socketService.connect();
+      
+      // Set username and join the room
+      socketService.setUsername(initialUsername);
+      socketService.joinRoom(roomId, initialUsername);
+      setIsInRoom(true);
+
+      // Set initial room state if we're the first one in the room
+      if (initialContent || editorContent) {
+        socketService.setRoomState(roomId, editorContent || initialContent, language, fileName);
+      }
+
+      // Fetch current room users
+      socketService.getRoomUsers(roomId, ({ users }) => {
+        if (Array.isArray(users) && users.length > 0) {
+          setConnectedUsers(users.map(user => user.username).filter(Boolean));
+        } else {
+          // If no other users, at least add ourselves
+          setConnectedUsers([initialUsername]);
+        }
+      });
+
+      // Handle room state updates from server
+      socketService.onRoomState(({ code, language: roomLanguage, fileName: roomFileName, terminalOutput, users }) => {
+        if (code && roomLanguage) {
+          setEditorContent(code);
+          if (terminalOutput) {
+            setOutput(terminalOutput);
+          }
+          
+          // Update connected users if provided
+          if (users && Array.isArray(users)) {
+            setConnectedUsers(users.map(user => user.username).filter(Boolean));
+          }
+          
+          // Only update URL state if we're joining an existing room
+          if (!initialContent) {
+            navigate('/editor', {
+              state: {
+                ...location.state,
+                language: roomLanguage,
+                fileName: roomFileName,
+              },
+              replace: true // Replace current history entry to avoid navigation issues
+            });
+          }
+        }
+      });
+
+      // Handle terminal output updates from other users
+      socketService.onTerminalOutput(({ output: newOutput }) => {
+        setOutput(newOutput);
+      });
+
+      // Handle terminal clear events
+      socketService.onTerminalClear(() => {
+        setOutput('');
+      });
+
+      // Handle code updates from other users
+      socketService.onCodeUpdate(({ code, language: remoteLang }) => {
+        setLastRemoteUpdate(Date.now());
+        setEditorContent(code);
+      });
+
+      // Handle user joined events
+      socketService.onUserJoined(({ username }) => {
+        if (username) {
+          setConnectedUsers(prev => {
+            if (!prev.includes(username)) {
+              return [...prev, username];
+            }
+            return prev;
+          });
+        }
+      });
+
+      // Handle user left events
+      socketService.onUserLeft(({ username }) => {
+        if (username) {
+          setConnectedUsers(prev => prev.filter(user => user !== username));
+        }
+      });
+
+      // Handle remote execution state
+      socketService.onExecutionStart(() => {
+        setIsRemoteExecuting(true);
+      });
+
+      socketService.onExecutionEnd(({ success, output }) => {
+        setIsRemoteExecuting(false);
+        setOutput(output);
+      });
+
+      // Cleanup on unmount
+      return () => {
+        if (roomId) {
+          socketService.leaveRoom(roomId);
+          clearFileStorage();
+        }
+        socketService.disconnect();
+      };
+    }
+  }, [roomId, language, fileName, initialContent, editorContent, initialUsername]);
+
+  // Handle editor content changes
   useEffect(() => {
     if (language && editorContent) {
       const storageKey = getStorageKey();
@@ -54,21 +183,34 @@ const EditorPage = () => {
   // Cleanup localStorage when unmounting
   useEffect(() => {
     return () => {
-      clearFileStorage();
+      const storageKey = getStorageKey();
+      localStorage.removeItem(storageKey);
     };
-  }, [clearFileStorage]);
+  }, [getStorageKey]);
 
   const runMutation = useMutation({
-    mutationFn: () => runCode(editorContent, language),
+    mutationFn: () => {
+      // Notify other users that code execution is starting
+      if (roomId) {
+        socketService.emitExecutionStart(roomId);
+      }
+      return runCode(editorContent, language);
+    },
     onSuccess: (data) => {
-      setOutput(
-        data.run.output || 
-        data.run.stderr || 
-        'No output'
-      );
+      const outputText = data.run.output || data.run.stderr || 'No output';
+      setOutput(outputText);
+      // Notify other users that execution has finished
+      if (roomId) {
+        socketService.emitExecutionEnd(roomId, true, outputText);
+      }
     },
     onError: (error) => {
-      setOutput(`Error: ${error.message}`);
+      const errorText = `Error: ${error.message}`;
+      setOutput(errorText);
+      // Notify other users about the error
+      if (roomId) {
+        socketService.emitExecutionEnd(roomId, false, errorText);
+      }
     }
   });
 
@@ -78,7 +220,15 @@ const EditorPage = () => {
   }
 
   const handleEditorChange = (value) => {
+    // Prevent echo of remote updates
+    if (Date.now() - lastRemoteUpdate < 100) return;
+    
     setEditorContent(value);
+    
+    // Emit changes to room if in collaboration mode
+    if (roomId) {
+      socketService.emitCodeChange(roomId, value, language);
+    }
   };
 
   const handleNewFile = () => {
@@ -89,20 +239,31 @@ const EditorPage = () => {
   return (
     <div className="min-h-screen bg-base-300 flex flex-col">
       <div className="bg-base-200 shadow-lg">
-        <div className="max-w-7xl mx-auto px-4 py-3 flex justify-end items-center">
+        <div className="max-w-7xl mx-auto px-4 py-3 flex justify-between items-center">
+          <div className="flex items-center gap-4">
+            {roomId && (
+              <RoomInfo roomId={roomId} connectedUsers={connectedUsers} />
+            )}
+          </div>
           <div className="flex items-center gap-2">
             <button 
               onClick={() => runMutation.mutate()}
-              disabled={runMutation.isPending}
-              className={`btn btn-sm btn-primary ${runMutation.isPending ? 'loading' : ''}`}
+              disabled={runMutation.isPending || isRemoteExecuting}
+              className={`btn btn-sm btn-primary ${(runMutation.isPending || isRemoteExecuting) ? 'loading' : ''}`}
             >
-              {runMutation.isPending ? 'Running...' : 'Run Code'}
+              {runMutation.isPending || isRemoteExecuting ? 'Running...' : 'Run Code'}
             </button>
             <button 
-              onClick={handleNewFile}
+              onClick={() => {
+                if (roomId) {
+                  socketService.leaveRoom(roomId);
+                }
+                clearFileStorage();
+                navigate('/');
+              }}
               className="btn btn-sm btn-ghost"
             >
-              New File
+              {roomId ? 'Leave Room' : 'New File'}
             </button>
           </div>
         </div>
@@ -142,6 +303,20 @@ const EditorPage = () => {
                     </span>
                   </div>
                 </div>
+
+                {roomId && connectedUsers.length > 0 && (
+                  <div className="mt-6">
+                    <h3 className="text-sm font-medium opacity-70 mb-2">Connected Users ({connectedUsers.length})</h3>
+                    <ul className="bg-base-300 rounded-lg p-2">
+                      {connectedUsers.map((username, index) => (
+                        <li key={index} className="flex items-center gap-2 py-1">
+                          <span className="w-2 h-2 rounded-full bg-green-500"></span>
+                          <span className="text-sm">{username}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
               </div>
             </motion.div>
           )}
@@ -213,6 +388,20 @@ const EditorPage = () => {
           </Split>
         </div>
       </div>
+      
+      {/* Username Modal */}
+      <AnimatePresence>
+        {showUsernameModal && (
+          <UsernameModal 
+            isOpen={showUsernameModal}
+            onClose={() => {
+              // If user closes modal without submitting a username, go back to home
+              navigate('/');
+            }}
+            onSubmit={handleUsernameSubmit}
+          />
+        )}
+      </AnimatePresence>
     </div>
   );
 };

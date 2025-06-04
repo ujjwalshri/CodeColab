@@ -80,6 +80,71 @@ class SocketService {
         }
     }
 
+    // WebRTC Signaling methods
+    sendSignal(roomId, signal, targetUserId) {
+        if (this.socket) {
+            this.socket.emit('webrtc:signal', { 
+                roomId, 
+                signal, 
+                targetUserId,
+                from: {
+                    userId: this.socket.id,
+                    username: this.username
+                }
+            });
+        }
+    }
+
+    onSignal(callback) {
+        if (this.socket) {
+            this.socket.on('webrtc:signal', callback);
+        }
+    }
+
+    // WebRTC video call methods
+    joinVideoCall(roomId) {
+        if (this.socket) {
+            this.socket.emit('webrtc:join-call', { 
+                roomId, 
+                user: {
+                    userId: this.socket.id,
+                    username: this.username
+                }
+            });
+        }
+    }
+
+    leaveVideoCall(roomId) {
+        if (this.socket) {
+            this.socket.emit('webrtc:leave-call', { 
+                roomId, 
+                user: {
+                    userId: this.socket.id,
+                    username: this.username
+                }
+            });
+        }
+    }
+
+    onUserJoinedCall(callback) {
+        if (this.socket) {
+            this.socket.on('webrtc:user-joined-call', callback);
+        }
+    }
+
+    onUserLeftCall(callback) {
+        if (this.socket) {
+            this.socket.on('webrtc:user-left-call', callback);
+        }
+    }
+
+    onAllUsersInCall(callback) {
+        if (this.socket) {
+            this.socket.on('webrtc:all-users-in-call', callback);
+        }
+    }
+
+    // Existing methods...
     emitCodeChange(roomId, code, language) {
         if (this.socket) {
             this.socket.emit('code:change', { roomId, code, language });

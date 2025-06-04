@@ -5,6 +5,7 @@ class SocketService {
         this.io = null;
         this.connectedUsers = new Map();
         this.activeRooms = new Map(); // Will store room state including code and language
+        this.callParticipants = new Map(); // Track participants in video calls: roomId -> Set of userIds
     }
 
     // Initialize socket server
@@ -28,6 +29,7 @@ class SocketService {
             this.handleUserConnection(socket);
             this.handleRoomEvents(socket);
             this.handleCodeEvents(socket);
+            this.handleWebRTCEvents(socket);
             this.handleDisconnection(socket);
         });
     }
@@ -98,6 +100,88 @@ class SocketService {
         socket.on('room:leave', ({ roomId }) => {
             this.handleRoomLeave(socket, roomId);
         });
+    }
+
+    // Handle WebRTC signaling for video calls
+    handleWebRTCEvents(socket) {
+        // Forward WebRTC signaling messages
+        socket.on('webrtc:signal', ({ roomId, signal, targetUserId, from }) => {
+            // Send to specific user if targetUserId is provided
+            if (targetUserId) {
+                this.io.to(targetUserId).emit('webrtc:signal', {
+                    signal,
+                    from
+                });
+            }
+        });
+
+        // Handle user joining a video call
+        socket.on('webrtc:join-call', ({ roomId, user }) => {
+            // Add user to call participants
+            if (!this.callParticipants.has(roomId)) {
+                this.callParticipants.set(roomId, new Set());
+            }
+            
+            const callRoom = this.callParticipants.get(roomId);
+            callRoom.add(socket.id);
+            
+            // Get user info from connected users
+            const userInfo = this.connectedUsers.get(socket.id) || user;
+
+            // Notify everyone in the room that this user joined
+            socket.to(roomId).emit('webrtc:user-joined-call', {
+                user: {
+                    userId: socket.id,
+                    username: userInfo?.username
+                }
+            });
+
+            // Send the current users in the call to the joining user
+            const usersInCall = Array.from(callRoom)
+                .filter(id => id !== socket.id)
+                .map(id => {
+                    const user = this.connectedUsers.get(id);
+                    return {
+                        userId: id,
+                        username: user?.username
+                    };
+                });
+            
+            socket.emit('webrtc:all-users-in-call', {
+                users: usersInCall
+            });
+        });
+
+        // Handle user leaving a video call
+        socket.on('webrtc:leave-call', ({ roomId }) => {
+            this.handleLeaveVideoCall(socket, roomId);
+        });
+    }
+
+    // Handle user leaving a video call
+    handleLeaveVideoCall(socket, roomId) {
+        const callRoom = this.callParticipants.get(roomId);
+        
+        if (callRoom) {
+            // Remove user from call participants
+            callRoom.delete(socket.id);
+            
+            // If call room is now empty, remove it
+            if (callRoom.size === 0) {
+                this.callParticipants.delete(roomId);
+            }
+            
+            // Get user info
+            const userInfo = this.connectedUsers.get(socket.id);
+            
+            // Notify others in the room that this user left the call
+            socket.to(roomId).emit('webrtc:user-left-call', {
+                user: {
+                    userId: socket.id,
+                    username: userInfo?.username
+                }
+            });
+        }
     }
 
     // Handle code-related events
@@ -173,6 +257,13 @@ class SocketService {
     // Handle user disconnection
     handleDisconnection(socket) {
         socket.on('disconnect', () => {
+            // Clean up video calls
+            this.callParticipants.forEach((participants, roomId) => {
+                if (participants.has(socket.id)) {
+                    this.handleLeaveVideoCall(socket, roomId);
+                }
+            });
+            
             // Remove user from all rooms they were in
             this.activeRooms.forEach((room, roomId) => {
                 if (room.users.has(socket.id)) {

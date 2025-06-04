@@ -6,7 +6,9 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { runCode } from '../services/runCode';
 import { socketService } from '../services/socket';
 import RoomInfo from '../components/RoomInfo';
+import VideoCall from '../components/VideoCall';
 import UsernameModal from '../components/UsernameModal';
+import FloatingDock from '../components/FloatingDock';
 import Split from 'react-split';
 import './Editor.css';
 import { CODE_SNIPPETS } from '../constants/languages';
@@ -21,6 +23,9 @@ const EditorPage = () => {
   const [isInRoom, setIsInRoom] = useState(false);
   const [isRemoteExecuting, setIsRemoteExecuting] = useState(false);
   const [showUsernameModal, setShowUsernameModal] = useState(!initialUsername && !!roomId);
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveNotification, setSaveNotification] = useState(false);
+
   const editorRef = useRef(null);
   const monacoRef = useRef(null);
   const cursorDecorations = useRef({});
@@ -33,6 +38,9 @@ const EditorPage = () => {
     const storageKey = getStorageKey();
     localStorage.removeItem(storageKey);
   }, [getStorageKey]);
+
+
+  
 
   // Initialize editor content with priority:
   // 1. Uploaded file content (initialContent)
@@ -414,6 +422,38 @@ const EditorPage = () => {
     navigate('/');
   };
 
+  // Handle file saving functionality
+  const handleSaveFile = () => {
+    if (!editorContent) return;
+    
+    setIsSaving(true);
+    
+    try {
+      // Create a blob with the editor content
+      const blob = new Blob([editorContent], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      
+      // Create a link element and trigger the download
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName || `untitled.${language}`;
+      document.body.appendChild(a);
+      a.click();
+      
+      // Clean up
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      
+      // Show success notification
+      setSaveNotification(true);
+      setTimeout(() => setSaveNotification(false), 3000);
+    } catch (error) {
+      console.error('Error saving file:', error);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+  
   return (
     <div className="min-h-screen bg-base-300 flex flex-col">
       <div className="bg-base-200 shadow-lg">
@@ -424,6 +464,14 @@ const EditorPage = () => {
             )}
           </div>
           <div className="flex items-center gap-2">
+            <button 
+              onClick={handleSaveFile}
+              disabled={isSaving}
+              className={`btn btn-sm btn-outline ${isSaving ? 'loading' : ''}`}
+              title="Download the current file to your computer"
+            >
+              {isSaving ? 'Saving...' : 'Save File'}
+            </button>
             <button 
               onClick={() => runMutation.mutate()}
               disabled={runMutation.isPending || isRemoteExecuting}
@@ -446,6 +494,20 @@ const EditorPage = () => {
           </div>
         </div>
       </div>
+      
+      {/* Toast notification for save success */}
+      <AnimatePresence>
+        {saveNotification && (
+          <motion.div
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0 }}
+            className="fixed top-4 right-4 bg-success text-white px-4 py-2 rounded shadow-lg z-50"
+          >
+            File saved successfully!
+          </motion.div>
+        )}
+      </AnimatePresence>
       
       <div className="flex-1 flex">
         <AnimatePresence initial={false}>
@@ -584,6 +646,9 @@ const EditorPage = () => {
           />
         )}
       </AnimatePresence>
+
+      <FloatingDock />
+      <VideoCall/>
     </div>
   );
 };
